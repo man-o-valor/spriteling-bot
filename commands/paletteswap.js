@@ -1,4 +1,6 @@
-const { SlashCommandBuilder, AttachmentBuilder } = require("discord.js");
+const { SlashCommandBuilder, AttachmentBuilder, MessageFlags } = require("discord.js");
+const render = require("svg-render");
+const { createCanvas, loadImage } = require("canvas");
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -7,11 +9,11 @@ module.exports = {
     .addAttachmentOption((option) =>
       option.setName("sprite").setDescription("The sprite to swap the palette of").setRequired(true)
     )
-    .addStringOption((option) => option.setName("palette").setDescription("The Lospec palette name").setRequired(false))
+    .addStringOption((option) => option.setName("palette").setDescription("The Lospec palette name (https://lospec.com/palette-list)").setRequired(false))
     .addBooleanOption((option) =>
       option
         .setName("unique")
-        .setDescription("Use unique palette colors per original (no reuse until palette exhausted)")
+        .setDescription("Preserve unique colors when mapping to the new palette (also good for palettes that are small or have very different colors from the original sprite)")
         .setRequired(false)
     ),
   async execute(interaction) {
@@ -20,12 +22,23 @@ module.exports = {
     paletteName = paletteName.toLowerCase().replace(/ /g, "-");
     const unique = interaction.options.getBoolean("unique") ?? false;
 
-    let spriteText;
+    if (sprite.name.endsWith(".svg")) {
+      spriteType = "vector";
+    } else if (sprite.name.endsWith(".png")) {
+      spriteType = "bitmap";
+    } else {
+      await interaction.reply({
+        content: `Unsupported image type! Try \`.png\` or \`.svg\`.`,
+        flags: MessageFlags.Ephemeral
+      });
+      return;
+    }
+
+    let spriteData;
     try {
-      const spriteData = await fetchWithTimeout(sprite.url, 2000);
-      spriteText = await spriteData.text();
+      spriteData = await fetchWithTimeout(sprite.url, 2000);
     } catch (err) {
-      await interaction.reply({ content: `Failed to fetch sprite: ${err.message}`, ephemeral: true });
+      await interaction.reply({ content: `Failed to fetch sprite: ${err.message}`, flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -35,57 +48,168 @@ module.exports = {
       paletteData = await fetchWithTimeout(`https://lospec.com/palette-list/${paletteName}.hex`, 2000);
       paletteText = await paletteData.text();
     } catch (err) {
-      await interaction.reply({ content: `Failed to fetch palette: ${err.message}`, ephemeral: true });
-      return;
-    }
-
-    if (!paletteData.ok) {
-      await interaction.reply({ content: `Palette "${paletteName}" not found on Lospec.`, ephemeral: true });
+      await interaction.reply({
+        content: `Palette "${paletteName}" not found on Lospec.`,
+        flags: MessageFlags.Ephemeral
+      });
       return;
     }
 
     if (!/[0-9a-fA-F]{6}/.test(paletteText)) {
-      await interaction.reply({ content: `Palette "${paletteName}" appears invalid or is unavailable.`, ephemeral: true });
+      await interaction.reply({
+        content: `Palette "${paletteName}" appears invalid or is unavailable.`,
+        flags: MessageFlags.Ephemeral
+      });
       return;
     }
 
-    console.log(spriteText);
-    console.log(paletteText);
-
-    const mappings = extractHexCodes(spriteText, paletteText, unique);
-    console.log(mappings);
-
-    function escapeRegExp(string) {
-      return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    try {
+      await interaction.deferReply();
+    } catch (err) {
+      return;
     }
 
-    for (const m of mappings) {
-      const re = new RegExp(escapeRegExp(m.original), "gi");
-      spriteText = spriteText.replace(re, m.new);
+    let attachments;
+    if (spriteType == "vector") {
+      attachments = await recolorSvg(sprite, spriteData, paletteText, unique, paletteName);
+    } else if (spriteType == "bitmap") {
+      attachments = await recolorPng(sprite, spriteData, paletteText, unique, paletteName);
+      if (attachments.length === 0) {
+        await interaction.editReply({
+          content: `Unsupported image type! Try \`.png\` or \`.svg\``,
+          flags: MessageFlags.Ephemeral
+        });
+        return;
+      }
     }
 
-    const spriteTextBuffer = Buffer.from(spriteText);
-
-    const name =
-      sprite.name.slice(0, sprite.name.lastIndexOf(".")) +
-      "-" +
-      paletteName +
-      sprite.name.slice(sprite.name.lastIndexOf("."));
-
-    const attachment = new AttachmentBuilder(spriteTextBuffer, {
-      name: name
-    });
-
-    console.log(attachment);
-
-    interaction.reply({ files: [attachment] });
+    try {
+      interaction.editReply({ files: attachments });
+    } catch (err) {}
   }
 };
+
+async function recolorSvg(sprite, spriteData, paletteText, unique, paletteName) {
+  let spriteText = await spriteData.text();
+  const mappings = extractHexCodes(spriteText, paletteText, unique);
+
+  for (const m of mappings) {
+    const re = new RegExp(m.original.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    spriteText = spriteText.replace(re, m.new);
+  }
+
+  const spriteTextBuffer = Buffer.from(spriteText);
+
+  const name =
+    sprite.name.slice(0, sprite.name.lastIndexOf(".")) +
+    "-" +
+    paletteName +
+    sprite.name.slice(sprite.name.lastIndexOf("."));
+
+  const spritePngBuffer = await render({
+    buffer: spriteTextBuffer,
+    width: 256
+  });
+
+  const svgattachment = new AttachmentBuilder(spriteTextBuffer, {
+    name: name
+  });
+  const pngattachment = new AttachmentBuilder(spritePngBuffer, {
+    name: name.replace(/svg(?!.*svg)/, "png")
+  });
+
+  return [svgattachment, pngattachment];
+}
+
+async function recolorPng(sprite, spriteData, paletteText, unique, paletteName) {
+  const paletteColors = paletteText
+    .trim()
+    .split(/\s+/)
+    .filter((hex) => /^[0-9a-fA-F]{6}$/.test(hex))
+    .map((hex) => "#" + hex.toUpperCase());
+
+  const arrayBuffer = await spriteData.arrayBuffer();
+  const imgBuffer = Buffer.from(arrayBuffer);
+  let img;
+  try {
+    img = await loadImage(imgBuffer);
+  } catch (err) {
+    return [];
+  }
+  const canvas = createCanvas(img.width, img.height);
+  const ctx = canvas.getContext("2d");
+  ctx.drawImage(img, 0, 0, img.width, img.height);
+  const imageData = ctx.getImageData(0, 0, img.width, img.height);
+
+  const uniqueColors = new Map();
+  const pixelData = imageData.data;
+  for (let i = 0; i < pixelData.length; i += 4) {
+    const r = pixelData[i];
+    const g = pixelData[i + 1];
+    const b = pixelData[i + 2];
+    const a = pixelData[i + 3];
+    const hex = `#${((r << 16) | (g << 8) | b).toString(16).padStart(6, "0").toUpperCase()}`;
+    if (!uniqueColors.has(hex)) {
+      uniqueColors.set(hex, { r, g, b, a, hex });
+    }
+  }
+
+  const found = Array.from(uniqueColors.values()).map((c) => ({
+    original: c.hex,
+    normalized: c.hex
+  }));
+  const mappings = paletteMatch([], found, paletteColors, unique);
+
+  const colorMap = new Map();
+  for (const m of mappings) {
+    const rgb = hexToRgb(m.original);
+    const newRgb = hexToRgb(m.new);
+    const key = `${rgb.r},${rgb.g},${rgb.b}`;
+    colorMap.set(key, newRgb);
+  }
+
+  for (let i = 0; i < pixelData.length; i += 4) {
+    const r = pixelData[i];
+    const g = pixelData[i + 1];
+    const b = pixelData[i + 2];
+    const key = `${r},${g},${b}`;
+    if (colorMap.has(key)) {
+      const newRgb = colorMap.get(key);
+      pixelData[i] = newRgb.r;
+      pixelData[i + 1] = newRgb.g;
+      pixelData[i + 2] = newRgb.b;
+    }
+  }
+
+  const { PNG } = require("pngjs");
+  const png = new PNG({ width: img.width, height: img.height });
+  png.data = Buffer.from(pixelData);
+  const pngBuffer = await new Promise((resolve, reject) => {
+    const chunks = [];
+    png
+      .pack()
+      .on("data", (chunk) => chunks.push(chunk))
+      .on("end", () => resolve(Buffer.concat(chunks)))
+      .on("error", reject);
+  });
+
+  const name =
+    sprite.name.slice(0, sprite.name.lastIndexOf(".")) +
+    "-" +
+    paletteName +
+    sprite.name.slice(sprite.name.lastIndexOf("."));
+
+  const pngattachment = new AttachmentBuilder(pngBuffer, {
+    name: name
+  });
+
+  return [pngattachment];
+}
 
 function extractHexCodes(str, paletteText, unique = false) {
   const regex = /(["'])(#([0-9a-fA-F]{3}|[0-9a-fA-F]{6}))\1/g;
   const seen = new Set();
-  const results = [];
+  let results = [];
   let match;
 
   const paletteColors = paletteText
@@ -123,7 +247,10 @@ function extractHexCodes(str, paletteText, unique = false) {
     let value = original.slice(1);
 
     if (value.length === 3) {
-      value = value.split("").map((c) => c + c).join("");
+      value = value
+        .split("")
+        .map((c) => c + c)
+        .join("");
     }
 
     const normalized = "#" + value.toUpperCase();
@@ -134,34 +261,7 @@ function extractHexCodes(str, paletteText, unique = false) {
     }
   }
 
-  if (unique) {
-    const minDistance = (hex) => {
-      const rgb1 = hexToRgb(hex);
-      let min = Infinity;
-      for (const p of paletteColors) {
-        const rgb2 = hexToRgb(p);
-        const d = Math.pow(rgb1.r - rgb2.r, 2) + Math.pow(rgb1.g - rgb2.g, 2) + Math.pow(rgb1.b - rgb2.b, 2);
-        if (d < min) min = d;
-      }
-      return Math.sqrt(min);
-    };
-
-    found.sort((a, b) => minDistance(a.normalized) - minDistance(b.normalized));
-
-    let available = paletteColors.slice();
-    for (const item of found) {
-      if (available.length === 0) available = paletteColors.slice();
-      const chosen = findClosestColor(item.normalized, available);
-      const idx = available.indexOf(chosen);
-      if (idx !== -1) available.splice(idx, 1);
-      results.push({ original: item.original, normalized: item.normalized, new: chosen });
-    }
-  } else {
-    for (const item of found) {
-      const closest = findClosestColor(item.normalized, paletteColors);
-      results.push({ original: item.original, normalized: item.normalized, new: closest });
-    }
-  }
+  results = paletteMatch(results, found, paletteColors, unique);
 
   return results;
 }
@@ -206,7 +306,39 @@ async function fetchWithTimeout(resource, ms = 2000) {
     return res;
   } catch (err) {
     clearTimeout(id);
-    if (err.name === 'AbortError') throw new Error('request timed out');
+    if (err.name === "AbortError") throw new Error("request timed out");
     throw err;
   }
+}
+
+function paletteMatch(results, found, paletteColors, unique) {
+  if (unique) {
+    const minDistance = (hex) => {
+      const rgb1 = hexToRgb(hex);
+      let min = Infinity;
+      for (const p of paletteColors) {
+        const rgb2 = hexToRgb(p);
+        const d = Math.pow(rgb1.r - rgb2.r, 2) + Math.pow(rgb1.g - rgb2.g, 2) + Math.pow(rgb1.b - rgb2.b, 2);
+        if (d < min) min = d;
+      }
+      return Math.sqrt(min);
+    };
+
+    found.sort((a, b) => minDistance(a.normalized) - minDistance(b.normalized));
+
+    let available = paletteColors.slice();
+    for (const item of found) {
+      if (available.length === 0) available = paletteColors.slice();
+      const chosen = findClosestColor(item.normalized, available);
+      const idx = available.indexOf(chosen);
+      if (idx !== -1) available.splice(idx, 1);
+      results.push({ original: item.original, normalized: item.normalized, new: chosen });
+    }
+  } else {
+    for (const item of found) {
+      const closest = findClosestColor(item.normalized, paletteColors);
+      results.push({ original: item.original, normalized: item.normalized, new: closest });
+    }
+  }
+  return results;
 }
