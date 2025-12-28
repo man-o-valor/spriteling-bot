@@ -12,7 +12,7 @@
   "dependencies": {
     "discord.js": "^14.25.1",
     "pngjs": "^7.0.0",
-    "svg-render": "^2.0.1",
-    "canvas": "^3.1.2"
+    "sharp": "^0.34.5",
+    "svg-render": "^2.0.1"
   }
 }

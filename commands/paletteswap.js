@@ -1,6 +1,6 @@
 const { SlashCommandBuilder, AttachmentBuilder, MessageFlags } = require("discord.js");
 const render = require("svg-render");
-const { createCanvas, loadImage } = require("canvas");
+const sharp = require("sharp");
 
 module.exports = {
   data: new SlashCommandBuilder()
@@ -13,7 +13,7 @@ module.exports = {
     .addBooleanOption((option) =>
       option
         .setName("unique")
-        .setDescription("Preserve unique colors when mapping to the new palette (also good for palettes that are small or have very different colors from the original sprite)")
+        .setDescription("Preserve unique colors when mapping to the new palette (will fry noisy images)")
         .setRequired(false)
     ),
   async execute(interaction) {
@@ -130,19 +130,21 @@ async function recolorPng(sprite, spriteData, paletteText, unique, paletteName) 
 
   const arrayBuffer = await spriteData.arrayBuffer();
   const imgBuffer = Buffer.from(arrayBuffer);
-  let img;
+  
+  let metadata;
+  let pixelData;
   try {
-    img = await loadImage(imgBuffer);
+    metadata = await sharp(imgBuffer).metadata();
+    const rawData = await sharp(imgBuffer)
+      .ensureAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    pixelData = rawData.data;
   } catch (err) {
     return [];
   }
-  const canvas = createCanvas(img.width, img.height);
-  const ctx = canvas.getContext("2d");
-  ctx.drawImage(img, 0, 0, img.width, img.height);
-  const imageData = ctx.getImageData(0, 0, img.width, img.height);
 
   const uniqueColors = new Map();
-  const pixelData = imageData.data;
   for (let i = 0; i < pixelData.length; i += 4) {
     const r = pixelData[i];
     const g = pixelData[i + 1];
@@ -181,17 +183,15 @@ async function recolorPng(sprite, spriteData, paletteText, unique, paletteName) 
     }
   }
 
-  const { PNG } = require("pngjs");
-  const png = new PNG({ width: img.width, height: img.height });
-  png.data = Buffer.from(pixelData);
-  const pngBuffer = await new Promise((resolve, reject) => {
-    const chunks = [];
-    png
-      .pack()
-      .on("data", (chunk) => chunks.push(chunk))
-      .on("end", () => resolve(Buffer.concat(chunks)))
-      .on("error", reject);
-  });
+  const pngBuffer = await sharp(pixelData, {
+    raw: {
+      width: metadata.width,
+      height: metadata.height,
+      channels: 4
+    }
+  })
+    .png()
+    .toBuffer();
 
   const name =
     sprite.name.slice(0, sprite.name.lastIndexOf(".")) +
